@@ -12,7 +12,7 @@ import webbrowser
 from contextlib import asynccontextmanager
 from datetime import datetime
 from functools import wraps
-from importlib.metadata import version
+from importlib.metadata import PackageNotFoundError, version
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -353,11 +353,18 @@ def get_cloud_connection_manager() -> "CloudConnectionManager":
     return cloud_connection_manager
 
 
+def _get_version() -> str:
+    try:
+        return version("daydream-scope")
+    except PackageNotFoundError:
+        return "0.0.0.dev"
+
+
 app = FastAPI(
     lifespan=lifespan,
     title="Scope",
     description="A tool for running and customizing real-time, interactive generative AI pipelines and models",
-    version=version("daydream-scope"),
+    version=_get_version(),
 )
 
 # Add CORS middleware
@@ -621,7 +628,14 @@ async def get_ice_servers(
             )
         )
 
-    return IceServersResponse(iceServers=ice_servers)
+    # When using a custom TURN server (e.g. local coturn for SSH tunnel setups),
+    # force relay-only mode so the browser doesn't waste time on host/srflx candidates
+    # that can never work through an SSH tunnel.
+    ice_transport_policy = "relay" if os.getenv("TURN_URL") else None
+
+    return IceServersResponse(
+        iceServers=ice_servers, iceTransportPolicy=ice_transport_policy
+    )
 
 
 @app.post("/api/v1/webrtc/offer", response_model=WebRTCOfferResponse)

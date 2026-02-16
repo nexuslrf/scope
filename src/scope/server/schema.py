@@ -210,6 +210,10 @@ class IceServersResponse(BaseModel):
     iceServers: list[IceServerConfig] = Field(
         ..., description="List of ICE servers for WebRTC connection"
     )
+    iceTransportPolicy: str | None = Field(
+        default=None,
+        description="ICE transport policy ('relay' forces TURN-only, useful for SSH tunnels)",
+    )
 
 
 class IceCandidateInit(BaseModel):

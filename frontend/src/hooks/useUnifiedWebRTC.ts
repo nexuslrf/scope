@@ -75,9 +75,17 @@ export function useUnifiedWebRTC(options?: UseUnifiedWebRTCOptions) {
       }
 
       console.log(
-        `[UnifiedWebRTC] Using ${iceServersResponse.iceServers.length} ICE servers`
+        `[UnifiedWebRTC] Using ${iceServersResponse.iceServers.length} ICE servers`,
+        iceServersResponse.iceTransportPolicy
+          ? `(transport policy: ${iceServersResponse.iceTransportPolicy})`
+          : ""
       );
-      return { iceServers: iceServersResponse.iceServers };
+      return {
+        iceServers: iceServersResponse.iceServers,
+        ...(iceServersResponse.iceTransportPolicy && {
+          iceTransportPolicy: iceServersResponse.iceTransportPolicy,
+        }),
+      };
     } catch (error) {
       console.warn(
         "[UnifiedWebRTC] Failed to fetch ICE servers, using default STUN:",

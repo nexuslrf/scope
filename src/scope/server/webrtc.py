@@ -296,6 +296,11 @@ class WebRTCManager:
                     f"Connection state changed to: {pc.connectionState} for session {session.id}"
                 )
                 if pc.connectionState == "failed":
+                    logger.warning(
+                        "WebRTC connection failed. If you're accessing the server remotely (e.g. via SSH tunnel), "
+                        "use the app on the same host as the server (open http://localhost:8000 there) or set "
+                        "HF_TOKEN / Twilio credentials for TURN relay. See README Firewalls section."
+                    )
                     _publish_connection_error(
                         session.id,
                         session.connection_id,
@@ -659,7 +664,27 @@ class WebRTCManager:
 
 
 def create_rtc_config() -> RTCConfiguration:
-    """Setup RTCConfiguration with TURN credentials if available."""
+    """Setup RTCConfiguration with TURN credentials if available.
+
+    Checks for TURN server configuration in this order:
+    1. Custom TURN server via TURN_URL env var (useful for local coturn setups,
+       e.g. when accessing the server via SSH tunnel on a network without internet)
+    2. Cloudflare TURN via HF_TOKEN
+    3. Twilio TURN via TWILIO_ACCOUNT_SID/TWILIO_AUTH_TOKEN
+    4. Default public STUN server (requires internet)
+    """
+    # 1. Check for custom TURN server (e.g. local coturn)
+    turn_url = os.getenv("TURN_URL")
+    if turn_url:
+        turn_username = os.getenv("TURN_USERNAME", "")
+        turn_password = os.getenv("TURN_PASSWORD", "")
+        ice_server = RTCIceServer(
+            urls=[turn_url], username=turn_username, credential=turn_password
+        )
+        logger.info(f"RTCConfiguration created with custom TURN server: {turn_url}")
+        return RTCConfiguration(iceServers=[ice_server])
+
+    # 2. Check for cloud TURN providers
     try:
         from huggingface_hub import get_token
 

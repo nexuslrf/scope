@@ -71,9 +71,15 @@ export function useWebRTC(options?: UseWebRTCOptions) {
           const iceServersResponse = await getIceServers();
           config = {
             iceServers: iceServersResponse.iceServers,
+            ...(iceServersResponse.iceTransportPolicy && {
+              iceTransportPolicy: iceServersResponse.iceTransportPolicy,
+            }),
           };
           console.log(
-            `Using ${iceServersResponse.iceServers.length} ICE servers from backend`
+            `Using ${iceServersResponse.iceServers.length} ICE servers from backend`,
+            iceServersResponse.iceTransportPolicy
+              ? `(transport policy: ${iceServersResponse.iceTransportPolicy})`
+              : ""
           );
         } catch (error) {
           console.warn(

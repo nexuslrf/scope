@@ -16,6 +16,7 @@ export interface IceServerConfig {
 
 export interface IceServersResponse {
   iceServers: IceServerConfig[];
+  iceTransportPolicy?: RTCIceTransportPolicy;
 }
 
 export interface SystemMetrics {
