@@ -744,7 +744,7 @@ class VaceEncodingBlock(ModularPipelineBlocks):
         # Get vace_input_masks from block_state or default to ones (all white)
         input_masks_data = block_state.vace_input_masks
         if input_masks_data is None:
-            # Default to ones (all white) - apply conditioning everywhere
+            # Default to ones (all white) - apply conditioning everywhere!
             input_masks_list = [
                 torch.ones(
                     (1, num_frames, height, width),

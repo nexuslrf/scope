@@ -78,7 +78,7 @@ def create_vace_attention_block_class(base_attention_block_class):
                 c = all_c.pop(-1)
 
             # Run standard transformer block on current context
-            # VACE blocks don't use caching since they process reference images once
+            # VACE blocks don't use caching since they process reference images once!
             # Pass block_mask to ensure the non-caching attention path is used
             # crossattn_cache=None because VACE processes reference images without caching
             c = super().forward(
