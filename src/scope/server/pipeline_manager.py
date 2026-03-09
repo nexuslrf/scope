@@ -653,6 +653,7 @@ class PipelineManager:
             "krea-realtime-video",
             "reward-forcing",
             "memflow",
+            "helios",
             "video-depth-anything",
             "controller-viz",
             "rife",
@@ -1098,6 +1099,40 @@ class PipelineManager:
                 device=get_device(),
             )
             logger.info("Gray pipeline initialized")
+            return pipeline
+
+        elif pipeline_id == "helios":
+            from scope.core.pipelines.helios.pipeline import HeliosPipeline
+
+            from .models_config import get_models_dir
+
+            models_dir = get_models_dir()
+            params = load_params or {}
+            config = OmegaConf.create(
+                {
+                    "model_dir": str(models_dir),
+                    "num_latent_frames_per_chunk": params.get(
+                        "num_latent_frames_per_chunk", 9
+                    ),
+                    "history_sizes": params.get("history_sizes", [16, 2, 1]),
+                    "pyramid_steps": params.get("pyramid_steps", [2, 2, 2]),
+                    "amplify_first_chunk": params.get("amplify_first_chunk", True),
+                    "guidance_scale": params.get("guidance_scale", 1.0),
+                }
+            )
+            self._apply_load_params(
+                config,
+                load_params,
+                default_height=384,
+                default_width=640,
+                default_seed=42,
+            )
+            pipeline = HeliosPipeline(
+                config,
+                device=torch.device("cuda"),
+                dtype=torch.bfloat16,
+            )
+            logger.info("Helios pipeline initialized")
             return pipeline
 
         elif pipeline_id == "optical-flow":

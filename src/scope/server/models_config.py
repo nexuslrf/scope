@@ -161,6 +161,9 @@ def models_are_downloaded(pipeline_id: str) -> bool:
     """
     Check if all required model files are downloaded and non-empty.
 
+    Paths whose name contains '*' are treated as glob patterns: at least one
+    matching file must exist and be non-empty (e.g. diffusion_pytorch_model*.safetensors).
+
     Args:
         pipeline_id: The pipeline ID to check models for.
 
@@ -170,7 +173,20 @@ def models_are_downloaded(pipeline_id: str) -> bool:
     required_files = get_required_model_files(pipeline_id)
 
     for file_path in required_files:
-        # Check if path exists
+        name = file_path.name
+        if "*" in name:
+            # Glob pattern: require at least one matching file, all non-empty
+            matches = list(file_path.parent.glob(name))
+            if not matches:
+                return False
+            for match in matches:
+                if match.is_file() and match.stat().st_size == 0:
+                    return False
+                if match.is_dir() and not any(match.iterdir()):
+                    return False
+            continue
+
+        # Exact path
         if not file_path.exists():
             return False
 
