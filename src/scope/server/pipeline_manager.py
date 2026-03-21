@@ -13,12 +13,38 @@ from omegaconf import OmegaConf
 
 from .kafka_publisher import publish_event
 
+# Params that require unloading and reloading the model when changed.
+# Everything else (guidance_scale, vace_context_scale, pyramid_steps, etc.)
+# is runtime-safe and will be applied in-place to the existing pipeline config.
+_RELOAD_REQUIRED_KEYS = frozenset({
+    "height",
+    "width",
+    "loras",
+    "lora_merge_mode",
+    "vae_type",
+    "quantization",
+    "enable_compile",
+    "num_latent_frames_per_chunk",
+    "history_sizes",
+})
+
+# Keys that can be patched directly onto pipeline._config without reload.
+_RUNTIME_PATCHABLE_KEYS = frozenset({
+    "guidance_scale",
+    "vace_context_scale",
+    "base_seed",
+    "pyramid_steps",
+    "amplify_first_chunk",
+})
+
 logger = logging.getLogger(__name__)
 
 
 def get_device() -> torch.device:
-    """Get the appropriate device (CUDA if available, CPU otherwise)."""
-    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    """Get the appropriate device for the current rank."""
+    from .distributed import get_device as dist_get_device
+
+    return dist_get_device()
 
 
 class PipelineNotAvailableException(Exception):
@@ -87,7 +113,8 @@ class PipelineManager:
             pipeline_id: ID of the pipeline to retrieve
 
         Returns:
-            Pipeline instance
+            Pipeline instance (wrapped in DistributedPipelineWrapper when
+            running as rank-0 in a multi-GPU distributed session).
 
         Raises:
             PipelineNotAvailableException: If pipeline is not loaded
@@ -102,7 +129,19 @@ class PipelineManager:
                 raise PipelineNotAvailableException(
                     f"Pipeline {pipeline_id} not available. Status: {status.value}"
                 )
-            return self._pipelines[pipeline_id]
+            pipeline = self._pipelines[pipeline_id]
+
+        from .distributed import (
+            DISTRIBUTED_PIPELINE_IDS,
+            DistributedPipelineWrapper,
+            is_distributed,
+            is_main_rank,
+        )
+
+        if is_distributed() and is_main_rank() and pipeline_id in DISTRIBUTED_PIPELINE_IDS:
+            return DistributedPipelineWrapper(pipeline, pipeline_id)
+
+        return pipeline
 
     async def _load_pipeline_by_id(
         self,
@@ -149,21 +188,22 @@ class PipelineManager:
             current_params = self._pipeline_load_params.get(pipeline_id, {})
             new_params = load_params or {}
 
-            # Check if pipeline is already loaded (either in _pipelines or as main pipeline)
+            # Check if pipeline is already loaded (either in _pipelines or as main pipeline).
+            # Only reload-required params need to match; runtime-safe params are patched in-place.
             is_loaded = False
             if pipeline_id in self._pipelines:
                 if (
                     self._pipeline_statuses.get(pipeline_id) == PipelineStatus.LOADED
-                    and current_params == new_params
+                    and not self._reload_required(current_params, new_params)
                 ):
                     is_loaded = True
             elif (
                 self._pipeline_id == pipeline_id
                 and self._status == PipelineStatus.LOADED
             ):
-                # Check if load params match
+                # Check if reload-required params match
                 current_main_params = self._load_params or {}
-                if current_main_params == new_params:
+                if not self._reload_required(current_main_params, new_params):
                     # Main pipeline is loaded, register it in _pipelines for chaining
                     if self._pipeline is not None:
                         self._pipelines[pipeline_id] = self._pipeline
@@ -435,9 +475,13 @@ class PipelineManager:
             pipelines_to_unload = set()
 
             for loaded_id in currently_loaded:
-                # Unload if pipeline not in new list or if load_params changed
+                # Unload if pipeline not in new list, or if any reload-required param changed.
+                # Runtime-safe params (guidance_scale, vace_context_scale, etc.) are patched
+                # in-place after loading and do NOT trigger a reload.
                 current_params = self._pipeline_load_params.get(loaded_id, {})
-                if loaded_id not in pipeline_ids or current_params != new_params:
+                if loaded_id not in pipeline_ids or self._reload_required(
+                    current_params, new_params
+                ):
                     pipelines_to_unload.add(loaded_id)
 
             # Unload pipelines that need to be unloaded
@@ -472,7 +516,36 @@ class PipelineManager:
         else:
             logger.error("Some pipelines failed to load")
 
+        # Patch runtime-safe params onto any kept (non-reloaded) pipeline and
+        # update the stored load_params so future comparisons stay current.
+        if load_params:
+            with self._lock:
+                for pid in pipeline_ids:
+                    if self._pipeline_statuses.get(pid) == PipelineStatus.LOADED:
+                        self._apply_runtime_params(pid, load_params)
+                        self._pipeline_load_params[pid] = load_params
+
         return success
+
+    @staticmethod
+    def _reload_required(current_params: dict, new_params: dict) -> bool:
+        """Return True only if a reload-required param has changed."""
+        for key in _RELOAD_REQUIRED_KEYS:
+            if current_params.get(key) != new_params.get(key):
+                return True
+        return False
+
+    def _apply_runtime_params(self, pipeline_id: str, load_params: dict) -> None:
+        """Patch runtime-safe params onto an already-loaded pipeline's config."""
+        pipeline = self._pipelines.get(pipeline_id)
+        if pipeline is None or not hasattr(pipeline, "_config"):
+            return
+        for key in _RUNTIME_PATCHABLE_KEYS:
+            if key in load_params:
+                try:
+                    OmegaConf.update(pipeline._config, key, load_params[key])
+                except Exception:
+                    pass  # config may not have this key for some pipelines
 
     def _get_vace_checkpoint_path(self) -> str:
         """Get the path to the VACE module checkpoint.
@@ -654,6 +727,7 @@ class PipelineManager:
             "reward-forcing",
             "memflow",
             "helios",
+            "helios-vace",
             "video-depth-anything",
             "controller-viz",
             "rife",
@@ -1104,6 +1178,12 @@ class PipelineManager:
         elif pipeline_id == "helios":
             from scope.core.pipelines.helios.pipeline import HeliosPipeline
 
+            from .distributed import (
+                CMD_LOAD,
+                broadcast_command,
+                is_distributed,
+                is_main_rank,
+            )
             from .models_config import get_models_dir
 
             models_dir = get_models_dir()
@@ -1127,12 +1207,73 @@ class PipelineManager:
                 default_width=640,
                 default_seed=42,
             )
+
+            enable_cp = is_distributed()
+            enable_compile = params.get("enable_compile", False)
+
+            # In distributed mode, tell worker ranks to load their copy of the
+            # pipeline before we load ours.  Workers will call dist.barrier()
+            # once they finish; we call dist.barrier() below so all ranks meet
+            # before the first inference request can arrive.
+            if enable_cp and is_main_rank():
+                broadcast_command(
+                    CMD_LOAD,
+                    {"pipeline_id": pipeline_id, "load_params": load_params or {}},
+                )
+
             pipeline = HeliosPipeline(
+                config,
+                device=get_device(),
+                dtype=torch.bfloat16,
+                enable_context_parallel=enable_cp,
+                enable_compile=enable_compile,
+            )
+
+            if enable_cp and is_main_rank():
+                import torch.distributed as _dist
+
+                _dist.barrier()  # wait for all worker ranks to finish loading
+
+            logger.info(
+                "Helios pipeline initialized (context_parallel=%s, compile=%s)",
+                enable_cp,
+                enable_compile,
+            )
+            return pipeline
+
+        elif pipeline_id == "helios-vace":
+            from scope.core.pipelines.helios.pipeline_vace import HeliosVACEPipeline
+
+            from .models_config import get_models_dir
+
+            models_dir = get_models_dir()
+            params = load_params or {}
+            config = OmegaConf.create(
+                {
+                    "model_dir": str(models_dir),
+                    "num_latent_frames_per_chunk": params.get(
+                        "num_latent_frames_per_chunk", 9
+                    ),
+                    "history_sizes": params.get("history_sizes", [16, 2, 1]),
+                    "pyramid_steps": params.get("pyramid_steps", [2, 2, 2]),
+                    "amplify_first_chunk": params.get("amplify_first_chunk", True),
+                    "guidance_scale": params.get("guidance_scale", 1.0),
+                    "vace_context_scale": params.get("vace_context_scale", 1.0),
+                }
+            )
+            self._apply_load_params(
+                config,
+                load_params,
+                default_height=384,
+                default_width=640,
+                default_seed=42,
+            )
+            pipeline = HeliosVACEPipeline(
                 config,
                 device=torch.device("cuda"),
                 dtype=torch.bfloat16,
             )
-            logger.info("Helios pipeline initialized")
+            logger.info("Helios VACE pipeline initialized")
             return pipeline
 
         elif pipeline_id == "optical-flow":

@@ -49,6 +49,9 @@ class HeliosPipeline(Pipeline):
         config,
         device: torch.device | None = None,
         dtype: torch.dtype = torch.bfloat16,
+        enable_context_parallel: bool = False,
+        cp_backend: str = "ulysses",
+        enable_compile: bool = False,
     ):
         from diffusers.models import AutoencoderKLWan
 
@@ -74,10 +77,33 @@ class HeliosPipeline(Pipeline):
             helios_path, subfolder="transformer", torch_dtype=dtype
         ).to(self.device)
         self.transformer.eval().requires_grad_(False)
-        # try:
-        #     self.transformer.set_attention_backend("_flash_3_hub")
-        # except Exception:
-        self.transformer.set_attention_backend("flash_hub")
+        try:
+            self.transformer.set_attention_backend("_flash_3")
+        except Exception:
+            self.transformer.set_attention_backend("flash_hub")
+
+        if enable_context_parallel:
+            import torch.distributed as dist
+            from diffusers.models._modeling_parallel import ContextParallelConfig
+
+            world_size = dist.get_world_size()
+            if cp_backend == "ulysses":
+                cp_config = ContextParallelConfig(ulysses_degree=world_size)
+            elif cp_backend == "ring":
+                cp_config = ContextParallelConfig(ring_degree=world_size)
+            elif cp_backend == "unified":
+                cp_config = ContextParallelConfig(
+                    ring_degree=world_size // 2, ulysses_degree=world_size // 2
+                )
+            else:
+                raise ValueError(f"Unknown cp_backend: {cp_backend!r}")
+            self.transformer.enable_parallelism(config=cp_config)
+            import logging as _logging
+            _logging.getLogger(__name__).info(
+                "Helios: context parallelism enabled (backend=%s, world_size=%d)",
+                cp_backend,
+                world_size,
+            )
 
         # --- VAE (float32 for numerical stability during encode/decode) ---
         self.vae = AutoencoderKLWan.from_pretrained(
@@ -98,7 +124,14 @@ class HeliosPipeline(Pipeline):
             if model_dir
             else "google/umt5-xxl"
         )
-        self._tokenizer = HuggingfaceTokenizer(tokenizer_path, seq_len=226, clean="whitespace")
+        self._tokenizer = HuggingfaceTokenizer(tokenizer_path, seq_len=512, clean="whitespace")
+
+        # --- torch.compile (incompatible with group offload / low-VRAM mode) ---
+        if enable_compile:
+            torch.backends.cudnn.benchmark = True
+            self.transformer.compile(mode="max-autotune-no-cudagraphs", dynamic=False)
+            self.vae.compile(mode="max-autotune-no-cudagraphs", dynamic=False)
+            self._text_encoder.compile(mode="max-autotune-no-cudagraphs", dynamic=False)
 
         # --- VAE normalization constants ---
         self._latents_mean = (
@@ -260,8 +293,14 @@ class HeliosPipeline(Pipeline):
         H: int,
         W: int,
         patch_size: tuple[int, int, int] = (1, 2, 2),
+        generator: torch.Generator | None = None,
     ) -> torch.Tensor:
-        """Sample spatially-correlated block noise for pyramid stage transitions."""
+        """Sample spatially-correlated block noise for pyramid stage transitions.
+
+        Uses torch.randn + Cholesky decomposition (equivalent to MultivariateNormal.sample)
+        so that an explicit generator can be passed, ensuring all ranks produce identical
+        noise in multi-GPU context-parallel inference.
+        """
         gamma = self.scheduler.config.gamma
         _, ph, pw = patch_size
         block_size = ph * pw
@@ -270,12 +309,14 @@ class HeliosPipeline(Pipeline):
             torch.eye(block_size, device=self.device) * (1 + gamma)
             - torch.ones(block_size, block_size, device=self.device) * gamma
         )
-        cov += torch.eye(block_size, device=self.device) * 1e-6
-        dist = torch.distributions.MultivariateNormal(
-            torch.zeros(block_size, device=self.device), covariance_matrix=cov
-        )
+        cov += torch.eye(block_size, device=self.device) * 1e-8
+        cov = cov.float()  # Upcast to fp32 for numerical stability — cholesky is unreliable in fp16/bf16
+        # Cholesky factor L such that L @ L.T = cov; equivalent to MultivariateNormal
+        L = torch.linalg.cholesky(cov)
         block_number = B * C * T * (H // ph) * (W // pw)
-        noise = dist.sample((block_number,))  # [block_number, block_size]
+        # z ~ N(0, I), then z @ L.T ~ N(0, cov)
+        z = torch.randn(block_number, block_size, generator=generator, device=self.device)
+        noise = (z @ L.T)  # [block_number, block_size]
         noise = noise.view(B, C, T, H // ph, W // pw, ph, pw)
         noise = noise.permute(0, 1, 2, 3, 5, 4, 6).reshape(B, C, T, H, W)
         return noise
@@ -365,12 +406,17 @@ class HeliosPipeline(Pipeline):
                 latents_2d = F.interpolate(latents_2d, size=(h, w), mode="nearest")
                 latents = latents_2d.reshape(B, T, C, h, w).permute(0, 2, 1, 3, 4)
 
-                # Block-noise correction to fix upsample artifacts
+                # Block-noise correction to fix upsample artifacts.
+                # Seed is deterministic so all CP ranks produce identical noise.
                 ori_sigma = 1 - self.scheduler.ori_start_sigmas[i_s]
                 gamma = self.scheduler.config.gamma
                 alpha = 1 / (math.sqrt(1 + (1 / gamma)) * (1 - ori_sigma) + ori_sigma)
                 beta = alpha * (1 - ori_sigma) / math.sqrt(gamma)
-                noise = self._sample_block_noise(B, C, T, h, w).to(
+                block_noise_seed = self._config.base_seed + self._total_generated + i_s
+                block_noise_generator = torch.Generator(device=self.device).manual_seed(
+                    block_noise_seed
+                )
+                noise = self._sample_block_noise(B, C, T, h, w, generator=block_noise_generator).to(
                     device=self.device, dtype=torch.float32
                 )
                 latents = alpha * latents + beta * noise

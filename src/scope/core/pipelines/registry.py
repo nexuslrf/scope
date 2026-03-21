@@ -159,6 +159,7 @@ def _register_pipelines():
         ),
         ("memflow", ".memflow.pipeline", "MemFlowPipeline"),
         ("helios", ".helios.pipeline", "HeliosPipeline"),
+        ("helios-vace", ".helios.pipeline_vace", "HeliosVACEPipeline"),
         ("passthrough", ".passthrough.pipeline", "PassthroughPipeline"),
         (
             "video_depth_anything",

@@ -14,7 +14,7 @@ from .pipeline import HeliosPipeline
 # Helios-Distilled generates 9 latent frames per chunk; with temporal compression
 # factor 4 (causal VAE) the decoder produces ~33 pixel frames per chunk at 24 fps.
 OUTPUT_FPS = 24
-DEFAULT_NUM_CHUNKS = 5  # ~165 frames (~7 s of video)
+DEFAULT_NUM_CHUNKS = 44  # ~165 frames (~7 s of video)
 
 
 def generate_video(
@@ -128,8 +128,9 @@ def main():
         print_statistics(all_latency, all_fps)
     else:
         prompt_texts = [
-            "A serene aerial view of a misty mountain valley at dawn, golden light breaking through the clouds.",
-            "The mist slowly parts as the sun climbs higher, revealing a winding river far below.",
+            # "A serene aerial view of a misty mountain valley at dawn, golden light breaking through the clouds.",
+            # "The mist slowly parts as the sun climbs higher, revealing a winding river far below.",
+            "A playful raccoon is seen playing an electronic guitar, strumming the strings with its front paws. The raccoon has distinctive black facial markings and a bushy tail. It sits comfortably on a small stool, its body slightly tilted as it focuses intently on the instrument. The setting is a cozy, dimly lit room with vintage posters on the walls, adding a retro vibe. The raccoon's expressive eyes convey a sense of joy and concentration. Medium close-up shot, focusing on the raccoon's face and hands interacting with the guitar."
         ]
 
         output_path = output_dir / "output.mp4"

@@ -1906,6 +1906,23 @@ def open_browser_when_ready(host: str, port: int, server):
 def run_server(reload: bool, host: str, port: int, no_browser: bool):
     """Run the Daydream Scope server."""
 
+    # Multi-GPU: initialise the distributed process group when launched via
+    # torchrun.  Non-rank-0 processes skip the HTTP server entirely and enter
+    # a worker loop that participates in inference NCCL collectives on behalf
+    # of rank-0.
+    from .distributed import init_distributed, is_main_rank, run_worker_loop
+
+    is_dist = init_distributed()
+    if is_dist and not is_main_rank():
+        try:
+            run_worker_loop()
+        finally:
+            import torch.distributed as _dist
+
+            if _dist.is_initialized():
+                _dist.destroy_process_group()
+        return
+
     from scope.core.pipelines.registry import (
         PipelineRegistry,  # noqa: F401 - imported for side effects (registry initialization)
     )

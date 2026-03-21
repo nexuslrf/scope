@@ -70,4 +70,9 @@ class HeliosConfig(BasePipelineConfig):
         json_schema_extra=ui_field_config(order=7, label="Guidance scale"),
     )
 
+    enable_compile: bool = Field(
+        default=False,
+        json_schema_extra=ui_field_config(order=8, is_load_param=True, label="torch.compile"),
+    )
+
     modes = {"text": ModeDefaults(default=True)}
