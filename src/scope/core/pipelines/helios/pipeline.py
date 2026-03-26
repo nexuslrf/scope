@@ -14,6 +14,8 @@ import torch.nn.functional as F
 from ..base_schema import BasePipelineConfig
 from ..interface import Pipeline
 from ..process import postprocess_chunk
+from ..utils import Quantization
+from ..wan2_1.vae import create_vae
 from .schema import HeliosConfig
 
 if TYPE_CHECKING:
@@ -52,9 +54,8 @@ class HeliosPipeline(Pipeline):
         enable_context_parallel: bool = False,
         cp_backend: str = "ulysses",
         enable_compile: bool = False,
+        text_encoder_quantization: Quantization | None = None,
     ):
-        from diffusers.models import AutoencoderKLWan
-
         from ._vendor.scheduling_helios import HeliosScheduler
         from ._vendor.transformer_helios import HeliosTransformer3DModel
         from ..wan2_1.components.text_encoder import WanTextEncoderWrapper
@@ -105,26 +106,39 @@ class HeliosPipeline(Pipeline):
                 world_size,
             )
 
-        # --- VAE (float32 for numerical stability during encode/decode) ---
-        self.vae = AutoencoderKLWan.from_pretrained(
-            helios_path, subfolder="vae", torch_dtype=torch.float32
-        ).to(self.device)
-        self.vae.eval().requires_grad_(False)
+        # --- VAE ---
+        vae_type = getattr(config, "vae_type", "wan")
+        self.vae = create_vae(
+            model_dir=model_dir,
+            model_name="Wan2.1-T2V-1.3B",
+            vae_type=str(vae_type),
+        ).to(self.device, dtype=torch.float32)
 
         # --- Scheduler ---
         self.scheduler = HeliosScheduler.from_pretrained(helios_path, subfolder="scheduler")
 
-        # --- Text encoder: reuse WAN BF16 pth + 226-token tokenizer ---
+        # --- Text encoder: BF16 pth by default, FP8 safetensors when quantized ---
+        if text_encoder_quantization == Quantization.FP8_E4M3FN and model_dir:
+            text_encoder_path = os.path.join(
+                model_dir, "WanVideo_comfy", "umt5-xxl-enc-fp8_e4m3fn.safetensors"
+            )
+        else:
+            text_encoder_path = None  # WanTextEncoderWrapper default (BF16 pth)
         self._text_encoder = WanTextEncoderWrapper(
             model_name="Wan2.1-T2V-1.3B",
             model_dir=model_dir,
+            text_encoder_path=text_encoder_path,
         ).to(self.device)
+        if text_encoder_quantization == Quantization.FP8_E4M3FN:
+            # FP8 is a compressed storage format; cast to BF16 for inference
+            # (F.linear does not support mixed FP8/BF16 even on H100)
+            self._text_encoder.text_encoder.to(dtype=torch.bfloat16)
         tokenizer_path = (
             os.path.join(wan_base_path, "google", "umt5-xxl")
             if model_dir
             else "google/umt5-xxl"
         )
-        self._tokenizer = HuggingfaceTokenizer(tokenizer_path, seq_len=512, clean="whitespace")
+        self._tokenizer = HuggingfaceTokenizer(tokenizer_path, seq_len=226, clean="whitespace")
 
         # --- torch.compile (incompatible with group offload / low-VRAM mode) ---
         if enable_compile:
@@ -132,19 +146,6 @@ class HeliosPipeline(Pipeline):
             self.transformer.compile(mode="max-autotune-no-cudagraphs", dynamic=False)
             self.vae.compile(mode="max-autotune-no-cudagraphs", dynamic=False)
             self._text_encoder.compile(mode="max-autotune-no-cudagraphs", dynamic=False)
-
-        # --- VAE normalization constants ---
-        self._latents_mean = (
-            torch.tensor(self.vae.config.latents_mean)
-            .view(1, self.vae.config.z_dim, 1, 1, 1)
-            .to(self.device, torch.float32)
-        )
-        self._latents_std = (
-            1.0
-            / torch.tensor(self.vae.config.latents_std)
-            .view(1, self.vae.config.z_dim, 1, 1, 1)
-            .to(self.device, torch.float32)
-        )
 
         # --- Pre-compute fixed RoPE index tensors (keep_first_frame=True) ---
         # history_sizes sorted big→small: [16, 2, 1]
@@ -226,13 +227,10 @@ class HeliosPipeline(Pipeline):
 
         self._total_generated += latents.shape[2]
 
-        # Decode to pixels
-        current_latents = latents.to(torch.float32) / self._latents_std + self._latents_mean
-        current_latents = current_latents.to(self.vae.dtype)
-        video = self.vae.decode(current_latents, return_dict=False)[0]  # [1, C, T, H, W] BCTHW
-
-        # BCTHW → BTCHW → THWC [0, 1]
-        return {"video": postprocess_chunk(video.permute(0, 2, 1, 3, 4))}
+        # Decode to pixels: BCTHW → BTCHW for decode_to_pixel (denorm handled internally)
+        latents_btchw = latents.to(torch.float32).permute(0, 2, 1, 3, 4)
+        video = self.vae.decode_to_pixel(latents_btchw, use_cache=False)  # [1, T, C, H, W]
+        return {"video": postprocess_chunk(video)}
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -452,5 +450,4 @@ class HeliosPipeline(Pipeline):
                     dmd_timesteps=self.scheduler.timesteps,
                     all_timesteps=self.scheduler.timesteps,
                 )[0]
-
         return latents  # [1, C, T, H//8, W//8] at full resolution

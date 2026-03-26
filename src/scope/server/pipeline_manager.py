@@ -23,6 +23,7 @@ _RELOAD_REQUIRED_KEYS = frozenset({
     "lora_merge_mode",
     "vae_type",
     "quantization",
+    "text_encoder_quantization",
     "enable_compile",
     "num_latent_frames_per_chunk",
     "history_sizes",
@@ -1221,12 +1222,15 @@ class PipelineManager:
                     {"pipeline_id": pipeline_id, "load_params": load_params or {}},
                 )
 
+            text_encoder_quantization = params.get("text_encoder_quantization", None)
+
             pipeline = HeliosPipeline(
                 config,
                 device=get_device(),
                 dtype=torch.bfloat16,
                 enable_context_parallel=enable_cp,
                 enable_compile=enable_compile,
+                text_encoder_quantization=text_encoder_quantization,
             )
 
             if enable_cp and is_main_rank():
