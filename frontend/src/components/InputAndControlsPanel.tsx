@@ -479,7 +479,7 @@ export function InputAndControlsPanel({
                 ) : localStream ? (
                   <video
                     ref={videoRef}
-                    className="w-full h-full object-cover"
+                    className="w-full h-auto"
                     autoPlay
                     muted
                     playsInline

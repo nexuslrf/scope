@@ -729,6 +729,7 @@ class PipelineManager:
             "memflow",
             "helios",
             "helios-vace",
+            "helios-sdedit",
             "video-depth-anything",
             "controller-viz",
             "rife",
@@ -1278,6 +1279,70 @@ class PipelineManager:
                 dtype=torch.bfloat16,
             )
             logger.info("Helios VACE pipeline initialized")
+            return pipeline
+
+        elif pipeline_id == "helios-sdedit":
+            from scope.core.pipelines.helios.pipeline_sdedit import HeliosSDEditPipeline
+
+            from .distributed import (
+                CMD_LOAD,
+                broadcast_command,
+                is_distributed,
+                is_main_rank,
+            )
+            from .models_config import get_models_dir
+
+            models_dir = get_models_dir()
+            params = load_params or {}
+            config = OmegaConf.create(
+                {
+                    "model_dir": str(models_dir),
+                    "num_latent_frames_per_chunk": params.get(
+                        "num_latent_frames_per_chunk", 9
+                    ),
+                    "history_sizes": params.get("history_sizes", [16, 2, 1]),
+                    "pyramid_steps": params.get("pyramid_steps", [2, 2, 2]),
+                    "amplify_first_chunk": params.get("amplify_first_chunk", True),
+                    "guidance_scale": params.get("guidance_scale", 1.0),
+                    "edit_type": params.get("edit_type", "sdedit"),
+                    "edit_stage": params.get("edit_stage", 1.0),
+                    "source_prompt": params.get("source_prompt", ""),
+                    "source_guidance_scale": params.get("source_guidance_scale", 1.0),
+                    "target_guidance_scale": params.get("target_guidance_scale", 1.0),
+                    "zeta_scale": params.get("zeta_scale", 1e-3),
+                }
+            )
+            self._apply_load_params(
+                config,
+                load_params,
+                default_height=384,
+                default_width=640,
+                default_seed=42,
+            )
+
+            enable_cp = is_distributed()
+
+            if enable_cp and is_main_rank():
+                broadcast_command(
+                    CMD_LOAD,
+                    {"pipeline_id": pipeline_id, "load_params": load_params or {}},
+                )
+
+            pipeline = HeliosSDEditPipeline(
+                config,
+                device=get_device(),
+                dtype=torch.bfloat16,
+                enable_context_parallel=enable_cp,
+            )
+
+            if enable_cp and is_main_rank():
+                import torch.distributed as _dist
+
+                _dist.barrier()
+
+            logger.info(
+                "Helios SDEdit pipeline initialized (context_parallel=%s)", enable_cp
+            )
             return pipeline
 
         elif pipeline_id == "optical-flow":

@@ -21,13 +21,29 @@ def _needs_resize(h: int, w: int, target_h: int, target_w: int) -> bool:
     return h != target_h or w != target_w
 
 
-def _resize_thwc(
+def _resize_and_crop_thwc(
     frame: torch.Tensor, target_h: int, target_w: int, output_dtype: torch.dtype
 ) -> torch.Tensor:
-    """Resize a THWC tensor, returning result in the same format."""
+    """Resize-then-center-crop a THWC tensor to (target_h, target_w).
+
+    Scales the input so the shorter dimension fills the target, then crops
+    the center to the exact target size. Preserves aspect ratio with no
+    distortion.
+    """
+    h, w = frame.shape[1], frame.shape[2]
+    scale = max(target_h / h, target_w / w)
+    scaled_h = round(h * scale)
+    scaled_w = round(w * scale)
+
     frame_tchw = frame.permute(0, 3, 1, 2).float()
-    frame_resized = _resize_tchw(frame_tchw, target_h, target_w)
-    return frame_resized.permute(0, 2, 3, 1).to(output_dtype)
+    frame_scaled = _resize_tchw(frame_tchw, scaled_h, scaled_w)
+
+    # Center crop
+    top = (scaled_h - target_h) // 2
+    left = (scaled_w - target_w) // 2
+    frame_cropped = frame_scaled[:, :, top : top + target_h, left : left + target_w]
+
+    return frame_cropped.permute(0, 2, 3, 1).to(output_dtype)
 
 
 def normalize_frame_sizes(
@@ -72,7 +88,7 @@ def normalize_frame_sizes(
             normalized.append(frame)
         else:
             logger.debug(f"Resized frame {i} from {w}x{h} to {target_w}x{target_h}")
-            normalized.append(_resize_thwc(frame, target_h, target_w, output_dtype))
+            normalized.append(_resize_and_crop_thwc(frame, target_h, target_w, output_dtype))
 
     return normalized
 

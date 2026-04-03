@@ -19,6 +19,32 @@ export const FPS = 15;
 export const MIN_FPS = 5;
 export const MAX_FPS = 30;
 
+/**
+ * Compute downsampled canvas dimensions from native camera resolution.
+ * - Square (aspect ≈ 1:1): cap at 512×512
+ * - Landscape (w > h): cap at height 480, scale width proportionally
+ * - Portrait (h > w): cap at width 480, scale height proportionally
+ */
+function computeDownsampledDimensions(
+  w: number,
+  h: number
+): { width: number; height: number } {
+  const ratio = w / h;
+  if (ratio >= 0.9 && ratio <= 1.1) {
+    // Square-ish
+    if (w <= 512) return { width: w, height: h };
+    return { width: 512, height: 512 };
+  } else if (w > h) {
+    // Landscape
+    if (h <= 480) return { width: w, height: h };
+    return { width: Math.round(w * (480 / h)), height: 480 };
+  } else {
+    // Portrait
+    if (w <= 480) return { width: w, height: h };
+    return { width: 480, height: Math.round(h * (480 / w)) };
+  }
+}
+
 export function useVideoSource(props?: UseVideoSourceProps) {
   const [localStream, setLocalStream] = useState<MediaStream | null>(null);
   const [isInitializing, setIsInitializing] = useState(false);
@@ -33,6 +59,24 @@ export function useVideoSource(props?: UseVideoSourceProps) {
   } | null>(null);
 
   const videoElementRef = useRef<HTMLVideoElement | null>(null);
+  // Refs for camera canvas pipeline cleanup
+  const nativeCameraStreamRef = useRef<MediaStream | null>(null);
+  const cameraRafRef = useRef<number | null>(null);
+
+  const stopNativeCamera = useCallback(() => {
+    if (cameraRafRef.current !== null) {
+      cancelAnimationFrame(cameraRafRef.current);
+      cameraRafRef.current = null;
+    }
+    if (nativeCameraStreamRef.current) {
+      nativeCameraStreamRef.current.getTracks().forEach(t => t.stop());
+      nativeCameraStreamRef.current = null;
+    }
+    if (videoElementRef.current) {
+      videoElementRef.current.pause();
+      videoElementRef.current = null;
+    }
+  }, []);
 
   const createVideoFromSource = useCallback((videoSource: string | File) => {
     const video = document.createElement("video");
@@ -138,17 +182,52 @@ export function useVideoSource(props?: UseVideoSourceProps) {
       setError(null);
       setIsInitializing(true);
 
-      // Request camera access - browser will handle device selection
-      const stream = await navigator.mediaDevices.getUserMedia({
+      // Get native camera stream at its natural resolution
+      const nativeStream = await navigator.mediaDevices.getUserMedia({
         video: {
-          width: { ideal: 512, min: 256, max: 512 },
-          height: { ideal: 512, min: 256, max: 512 },
           frameRate: { ideal: FPS, min: MIN_FPS, max: MAX_FPS },
         },
         audio: false,
       });
 
-      setVideoResolution({ width: 512, height: 512 });
+      const trackSettings = nativeStream.getVideoTracks()[0].getSettings();
+      const nativeW = trackSettings.width ?? 640;
+      const nativeH = trackSettings.height ?? 480;
+
+      // Compute aspect-ratio-preserving target size
+      const { width: targetW, height: targetH } = computeDownsampledDimensions(
+        nativeW,
+        nativeH
+      );
+      setVideoResolution({ width: targetW, height: targetH });
+
+      // Store native stream for later cleanup
+      nativeCameraStreamRef.current = nativeStream;
+
+      // Create hidden video element to receive the native stream
+      const nativeVideo = document.createElement("video");
+      nativeVideo.srcObject = nativeStream;
+      nativeVideo.muted = true;
+      nativeVideo.playsInline = true;
+      videoElementRef.current = nativeVideo;
+
+      await nativeVideo.play();
+
+      // Downsample onto a canvas and stream from it
+      const canvas = document.createElement("canvas");
+      canvas.width = targetW;
+      canvas.height = targetH;
+      const ctx = canvas.getContext("2d")!;
+
+      const drawFrame = () => {
+        if (!nativeVideo.paused && !nativeVideo.ended) {
+          ctx.drawImage(nativeVideo, 0, 0, targetW, targetH);
+        }
+        cameraRafRef.current = requestAnimationFrame(drawFrame);
+      };
+      cameraRafRef.current = requestAnimationFrame(drawFrame);
+
+      const stream = canvas.captureStream(FPS);
       setLocalStream(stream);
       setIsInitializing(false);
       return stream;
@@ -174,12 +253,9 @@ export function useVideoSource(props?: UseVideoSourceProps) {
 
       // Spout/NDI mode - no local stream needed, input comes from server-side receiver
       if (newMode === "spout" || newMode === "ndi") {
+        stopNativeCamera();
         if (localStream) {
           localStream.getTracks().forEach(track => track.stop());
-        }
-        if (videoElementRef.current) {
-          videoElementRef.current.pause();
-          videoElementRef.current = null;
         }
         setLocalStream(null);
         return;
@@ -188,7 +264,8 @@ export function useVideoSource(props?: UseVideoSourceProps) {
       let newStream: MediaStream | null = null;
 
       if (newMode === "video") {
-        // Create video file stream
+        // Clean up camera pipeline if switching away from camera
+        stopNativeCamera();
         try {
           newStream = await createVideoFileStream(FPS);
         } catch (error) {
@@ -196,7 +273,11 @@ export function useVideoSource(props?: UseVideoSourceProps) {
           setError("Failed to load test video");
         }
       } else if (newMode === "camera") {
-        // Switch to camera mode
+        // Stop any existing video element
+        if (videoElementRef.current) {
+          videoElementRef.current.pause();
+          videoElementRef.current = null;
+        }
         try {
           newStream = await requestCameraAccess();
         } catch (error) {
@@ -224,16 +305,16 @@ export function useVideoSource(props?: UseVideoSourceProps) {
           localStream.getTracks().forEach(track => track.stop());
         }
 
-        // Stop video element if switching away from video mode
-        if (videoElementRef.current && newMode === "camera") {
-          videoElementRef.current.pause();
-          videoElementRef.current = null;
-        }
-
         setLocalStream(newStream);
       }
     },
-    [localStream, createVideoFileStream, requestCameraAccess, props]
+    [
+      localStream,
+      createVideoFileStream,
+      requestCameraAccess,
+      stopNativeCamera,
+      props,
+    ]
   );
 
   const handleVideoFileUpload = useCallback(
@@ -297,16 +378,12 @@ export function useVideoSource(props?: UseVideoSourceProps) {
   );
 
   const stopVideo = useCallback(() => {
+    stopNativeCamera();
     if (localStream) {
       localStream.getTracks().forEach(track => track.stop());
       setLocalStream(null);
     }
-
-    if (videoElementRef.current) {
-      videoElementRef.current.pause();
-      videoElementRef.current = null;
-    }
-  }, [localStream]);
+  }, [localStream, stopNativeCamera]);
 
   const reinitializeVideoSource = useCallback(async () => {
     setIsInitializing(true);
@@ -314,6 +391,7 @@ export function useVideoSource(props?: UseVideoSourceProps) {
 
     // Ensure we're in video mode when reinitializing
     setMode("video");
+    stopNativeCamera();
 
     try {
       // Stop current stream if it exists
@@ -330,19 +408,16 @@ export function useVideoSource(props?: UseVideoSourceProps) {
     } finally {
       setIsInitializing(false);
     }
-  }, [localStream, createVideoFileStream]);
+  }, [localStream, createVideoFileStream, stopNativeCamera]);
 
   // Initialize with video mode on mount (only if enabled)
   useEffect(() => {
     if (!props?.enabled) {
       // If not enabled, stop any existing stream and clear state
+      stopNativeCamera();
       if (localStream) {
         localStream.getTracks().forEach(track => track.stop());
         setLocalStream(null);
-      }
-      if (videoElementRef.current) {
-        videoElementRef.current.pause();
-        videoElementRef.current = null;
       }
       return;
     }
@@ -364,11 +439,9 @@ export function useVideoSource(props?: UseVideoSourceProps) {
 
     // Cleanup on unmount
     return () => {
+      stopNativeCamera();
       if (localStream) {
         localStream.getTracks().forEach(track => track.stop());
-      }
-      if (videoElementRef.current) {
-        videoElementRef.current.pause();
       }
     };
   }, [props?.enabled, createVideoFileStream]); // eslint-disable-line react-hooks/exhaustive-deps

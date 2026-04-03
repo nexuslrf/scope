@@ -19,8 +19,6 @@ export function useLocalVideo() {
       // Request camera access - this will trigger browser's native device selection
       const stream = await navigator.mediaDevices.getUserMedia({
         video: {
-          width: { ideal: 512, min: 256, max: 512 },
-          height: { ideal: 512, min: 256, max: 512 },
           frameRate: { ideal: FPS, min: MIN_FPS, max: MAX_FPS },
         },
         audio: false,
@@ -72,8 +70,6 @@ export function useLocalVideo() {
         const stream = await navigator.mediaDevices.getUserMedia({
           video: {
             deviceId: { exact: deviceId },
-            width: { ideal: 512, min: 256, max: 512 },
-            height: { ideal: 512, min: 256, max: 512 },
             frameRate: { ideal: FPS, min: MIN_FPS, max: MAX_FPS },
           },
           audio: false,
