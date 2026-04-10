@@ -13,6 +13,16 @@ class Requirements(BaseModel):
     """Requirements for pipeline configuration."""
 
     input_size: int
+    frame_strategy: str = "uniform"
+    """How to sample frames from the input queue when more than input_size are available.
+
+    - "uniform"    : uniformly sample input_size frames across the full queue (default,
+                     preserves temporal coverage for slow pipelines).
+    - "sequential" : take the oldest input_size frames (FIFO). Chunks are temporally
+                     consecutive; best for pre-recorded video where coherence matters.
+    - "realtime"   : discard all but the newest input_size frames. Minimises latency;
+                     best for live camera streams where responsiveness matters.
+    """
 
 
 class Pipeline(ABC):

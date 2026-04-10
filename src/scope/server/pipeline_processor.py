@@ -78,13 +78,18 @@ class PipelineProcessor:
 
         self.is_prepared = False
 
-        # Output FPS tracking (based on frames added to output queue)
-        # Stores inter-frame durations (seconds)
-        self.output_frame_deltas = deque(maxlen=OUTPUT_FPS_SAMPLE_SIZE)
-        self._last_frame_time: float | None = None
-        # Start with a higher initial FPS to prevent initial queue buildup
+        # Output FPS tracking — measured at batch granularity, not per-frame.
+        # Per-frame tracking produces artificially high FPS because all frames in a
+        # chunk are enqueued in a tight burst (microseconds apart), hiding the true
+        # inter-chunk cycle time. Batch-level tracking gives the real sustained rate:
+        #   fps = num_frames / (wall-clock time since previous batch completed)
+        self._last_batch_complete_time: float | None = None
+        self._sustained_fps_ema: float = MAX_FPS  # EMA; starts high, converges quickly
         self.current_output_fps = MAX_FPS
         self.output_fps_lock = threading.Lock()
+        # Keep legacy fields so existing callers don't break
+        self.output_frame_deltas: deque = deque(maxlen=OUTPUT_FPS_SAMPLE_SIZE)
+        self._last_frame_time: float | None = None
 
         self.paused = False
         # Input mode is signaled by the frontend at stream start
@@ -264,50 +269,66 @@ class PipelineProcessor:
         logger.info(f"Worker thread stopped for pipeline: {self.pipeline_id}")
 
     def prepare_chunk(
-        self, input_queue_ref: queue.Queue, chunk_size: int
+        self,
+        input_queue_ref: queue.Queue,
+        chunk_size: int,
+        frame_strategy: str = "uniform",
     ) -> list[torch.Tensor]:
         """
-        Sample frames uniformly from the queue, convert them to tensors, and remove processed frames.
+        Pull chunk_size frames from the queue according to frame_strategy.
 
-        This function implements uniform sampling across the entire queue to ensure
-        temporal coverage of input frames. It samples frames at evenly distributed
-        indices and removes all frames up to the last sampled frame to prevent
-        queue buildup.
+        Strategies
+        ----------
+        "sequential"
+            Take the oldest chunk_size frames (FIFO). Chunks are temporally
+            consecutive with no gaps. Any surplus frames remain in the queue
+            for the next chunk. Best for pre-recorded video files.
 
-        Note:
-            This function must be called with a queue reference obtained while holding
-            input_queue_lock. The caller is responsible for thread safety.
+        "realtime"
+            Discard all frames except the newest chunk_size. Minimises
+            input latency at the cost of skipping intermediate frames.
+            Best for live camera streams.
 
-        Example:
-            With queue_size=8 and chunk_size=4:
-            - step = 8/4 = 2.0
-            - indices = [0, 2, 4, 6] (uniformly distributed)
-            - Returns frames at positions 0, 2, 4, 6
-            - Removes frames 0-6 from queue (7 frames total)
-            - Keeps frame 7 in queue
+        "uniform"  (default / legacy)
+            Uniformly sample chunk_size frames across the full queue and
+            discard everything up to the last sampled frame. Balances
+            temporal coverage with queue draining.
 
         Args:
-            input_queue_ref: Reference to the input queue (obtained while holding lock)
-            chunk_size: Number of frames to sample
+            input_queue_ref: Reference to the input queue (caller holds lock).
+            chunk_size: Number of frames to return.
+            frame_strategy: One of "sequential", "realtime", or "uniform".
 
         Returns:
-            List of tensor frames, each (1, H, W, C) for downstream preprocess_chunk
+            List of tensor frames, each (1, H, W, C).
         """
+        if frame_strategy == "sequential":
+            # FIFO: take exactly the first chunk_size frames, leave the rest.
+            frames = []
+            for _ in range(chunk_size):
+                frames.append(input_queue_ref.get_nowait())
+            return frames
 
-        # Calculate uniform sampling step
+        if frame_strategy == "realtime":
+            # Drain everything, keep only the last chunk_size frames.
+            all_frames = []
+            while not input_queue_ref.empty():
+                try:
+                    all_frames.append(input_queue_ref.get_nowait())
+                except queue.Empty:
+                    break
+            return all_frames[-chunk_size:]
+
+        # Default: "uniform" — legacy behaviour.
         step = input_queue_ref.qsize() / chunk_size
-        # Generate indices for uniform sampling
         indices = [round(i * step) for i in range(chunk_size)]
-        # Extract VideoFrames at sampled indices
-        video_frames = []
-
-        # Drop all frames up to and including the last sampled frame
+        frames = []
         last_idx = indices[-1]
         for i in range(last_idx + 1):
             frame = input_queue_ref.get_nowait()
             if i in indices:
-                video_frames.append(frame)
-        return video_frames
+                frames.append(frame)
+        return frames
 
     def process_chunk(self):
         """Process a single chunk of frames."""
@@ -364,6 +385,12 @@ class PipelineProcessor:
         # Handle reset_cache: clear this processor's cache
         if reset_cache:
             logger.info(f"Clearing cache for pipeline processor: {self.pipeline_id}")
+            # Mark as unprepared so init_cache=True reaches the pipeline even if
+            # this iteration returns early (e.g. waiting for enough video frames).
+            # Without this, reset_cache is consumed here but the early-return path
+            # causes the next iteration to call the pipeline with init_cache=False,
+            # silently skipping the state reset.
+            self.is_prepared = False
             # Clear output queue
             if self.output_queue:
                 while not self.output_queue.empty():
@@ -385,9 +412,23 @@ class PipelineProcessor:
         if requirements is not None:
             current_chunk_size = requirements.input_size
 
-            # Capture a local reference to input_queue while holding the lock
-            # This ensures thread-safe access even if input_queue is reassigned
+            # Ensure the input queue is large enough to hold a full chunk.
+            # This is needed when pipelines request more frames than the default
+            # queue capacity (e.g. SDEdit requests 33 frames for the WAN VAE).
             with self.input_queue_lock:
+                if self.input_queue.maxsize < current_chunk_size:
+                    old_q = self.input_queue
+                    new_q = queue.Queue(maxsize=current_chunk_size + 10)
+                    while not old_q.empty():
+                        try:
+                            new_q.put_nowait(old_q.get_nowait())
+                        except queue.Full:
+                            break
+                    self.input_queue = new_q
+                    logger.info(
+                        "Expanded input queue to %d (chunk_size=%d)",
+                        new_q.maxsize, current_chunk_size,
+                    )
                 input_queue_ref = self.input_queue
 
             # Check if queue has enough frames before consuming them
@@ -396,8 +437,12 @@ class PipelineProcessor:
                 self.shutdown_event.wait(SLEEP_TIME)
                 return
 
-            # Use prepare_chunk to uniformly sample frames from the queue
-            video_input = self.prepare_chunk(input_queue_ref, current_chunk_size)
+            # Use prepare_chunk to sample frames from the queue
+            video_input = self.prepare_chunk(
+                input_queue_ref,
+                current_chunk_size,
+                frame_strategy=requirements.frame_strategy,
+            )
             input_frame_count = len(video_input) if video_input else 0
 
         try:
@@ -499,8 +544,6 @@ class PipelineProcessor:
             # Output frames are [H, W, C], convert to [1, H, W, C] for consistency
             for frame in output:
                 frame = frame.unsqueeze(0)
-                # Track when a frame is ready (production rate)
-                self._track_output_frame()
                 try:
                     self.output_queue.put_nowait(frame)
                 except queue.Full:
@@ -508,6 +551,11 @@ class PipelineProcessor:
                         f"Output queue full for {self.pipeline_id}, dropping processed frame"
                     )
                     continue
+
+            # Update sustained-FPS estimate at batch granularity.
+            # Measuring here (once per chunk) avoids the burst-timing artifact that
+            # makes per-frame tracking report 60 fps even when chunks take seconds.
+            self._track_output_batch(num_frames, processing_time)
 
             # Apply throttling if this pipeline is producing faster than next can consume
             # Only throttle if: (1) has video input, (2) has next processor
@@ -524,34 +572,54 @@ class PipelineProcessor:
 
         self.is_prepared = True
 
-    def _track_output_frame(self):
-        """Track when a frame is added to the output queue (production rate).
+    def _track_output_batch(self, num_frames: int, generation_time: float = 0.0):
+        """Update the sustained-FPS estimate from one completed output batch.
 
-        Stores inter-frame deltas instead of absolute timestamps so that
-        pauses don't artificially lower the measured FPS.
+        Uses wall-clock time between successive batch completions so that the
+        full generate → enqueue cycle is captured, not just the burst-enqueue
+        time within a single chunk (which would give artificially high FPS).
+
+        For the first batch there is no previous completion time, so we bootstrap
+        the EMA from the pipeline's own generation time to avoid the cold-start
+        problem where the EMA starts at MAX_FPS and takes many chunks to converge.
+
+        Args:
+            num_frames: Number of frames produced in this batch.
+            generation_time: Wall-clock seconds the pipeline call itself took.
+                             Only used for bootstrapping the first-chunk estimate.
         """
         now = time.time()
         with self.output_fps_lock:
-            if self._last_frame_time is not None:
-                delta = now - self._last_frame_time
-                self.output_frame_deltas.append(delta)
-
-            self._last_frame_time = now
-
-        self._calculate_output_fps()
-
-    def _calculate_output_fps(self):
-        """Calculate FPS from the average inter-frame delta."""
-        with self.output_fps_lock:
-            if len(self.output_frame_deltas) >= OUTPUT_FPS_MIN_SAMPLES:
-                avg_delta = sum(self.output_frame_deltas) / len(
-                    self.output_frame_deltas
+            if self._last_batch_complete_time is not None and num_frames > 0:
+                # Normal case: measure the full chunk-to-chunk cycle time.
+                cycle_time = now - self._last_batch_complete_time
+                if cycle_time > 0:
+                    batch_fps = num_frames / cycle_time
+                    batch_fps = max(MIN_FPS, min(MAX_FPS, batch_fps))
+                    # EMA with α=0.4: responds quickly but smooths single-chunk outliers
+                    alpha = 0.4
+                    self._sustained_fps_ema = (
+                        alpha * batch_fps + (1 - alpha) * self._sustained_fps_ema
+                    )
+                    self.current_output_fps = self._sustained_fps_ema
+                    logger.debug(
+                        "Batch FPS update: frames=%d cycle=%.2fs "
+                        "batch_fps=%.2f ema_fps=%.2f",
+                        num_frames, cycle_time, batch_fps, self._sustained_fps_ema,
+                    )
+            elif self._last_batch_complete_time is None and generation_time > 0 and num_frames > 0:
+                # First batch: bootstrap from the pipeline's own generation time.
+                # Without this the EMA starts at MAX_FPS (60) and takes many chunks
+                # to converge, causing a burst-then-stall on the first few chunks.
+                initial_fps = num_frames / generation_time
+                initial_fps = max(MIN_FPS, min(MAX_FPS, initial_fps))
+                self._sustained_fps_ema = initial_fps
+                self.current_output_fps = initial_fps
+                logger.debug(
+                    "Batch FPS bootstrap: frames=%d gen_time=%.2fs initial_fps=%.2f",
+                    num_frames, generation_time, initial_fps,
                 )
-                if avg_delta > 0:
-                    estimated_fps = 1.0 / avg_delta
-                    # Clamp to reasonable bounds
-                    estimated_fps = max(MIN_FPS, min(MAX_FPS, estimated_fps))
-                    self.current_output_fps = estimated_fps
+            self._last_batch_complete_time = now
 
     def get_fps(self) -> float:
         """Get the current dynamically calculated pipeline FPS.

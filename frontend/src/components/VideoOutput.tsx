@@ -80,6 +80,90 @@ export function VideoOutput({
     };
   }, [onVideoPlaying, remoteStream]);
 
+  // Adaptive playback rate: match playback speed to the pipeline's actual output rate.
+  //
+  // WebRTC MediaStream sources don't expose `buffered` TimeRanges, so we instead
+  // measure real play/stall cycles via `waiting` and `playing` events to estimate
+  // how fast the pipeline delivers video, then set playbackRate accordingly.
+  //
+  // After a stall we compute:
+  //   sustainableRate = (videoTimePlayed) / (playWallMs + stallWallMs)
+  // and set playbackRate = sustainableRate * 0.9 (10% safety margin).
+  // After RECOVERY_MS of smooth play we nudge the rate up 5% toward 1.0.
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video || !remoteStream) return;
+
+    const MIN_RATE = 0.2;
+    const RECOVERY_MS = 4000; // ms of stall-free play before nudging rate up
+    const RECOVERY_STEP = 1.05;
+    const POLL_MS = 200;
+
+    let targetRate = 1.0;
+    let stallStartMs = 0;
+    let playStartMs = 0;
+    let lastStallDurationMs = 0;
+    let smoothPlayingMs = 0;
+
+    const applyRate = (r: number) => {
+      targetRate = Math.max(MIN_RATE, Math.min(1.0, r));
+      video.playbackRate = targetRate;
+    };
+
+    const handleWaiting = () => {
+      stallStartMs = Date.now();
+      smoothPlayingMs = 0;
+
+      if (playStartMs > 0 && lastStallDurationMs > 0) {
+        // Estimate sustainable rate from the last complete play/stall cycle:
+        //   videoTimePlayed = playWallMs * currentRate
+        //   sustainableRate = videoTimePlayed / (playWallMs + stallWallMs)
+        const playWallMs = stallStartMs - playStartMs;
+        const videoTimePlayed = playWallMs * targetRate;
+        const totalCycleMs = playWallMs + lastStallDurationMs;
+        const sustainable = videoTimePlayed / totalCycleMs;
+        applyRate(sustainable * 0.9);
+      } else if (playStartMs > 0) {
+        // First stall — no prior stall data, reduce aggressively
+        applyRate(targetRate * 0.7);
+      }
+
+      playStartMs = 0;
+    };
+
+    const handlePlaying = () => {
+      const now = Date.now();
+      if (stallStartMs > 0) {
+        lastStallDurationMs = now - stallStartMs;
+        stallStartMs = 0;
+      }
+      playStartMs = now;
+    };
+
+    const intervalId = setInterval(() => {
+      if (video.paused || video.ended || stallStartMs > 0) return;
+      if (playStartMs === 0) return;
+
+      smoothPlayingMs += POLL_MS;
+
+      if (smoothPlayingMs >= RECOVERY_MS) {
+        // Pipeline sustained our current rate — try nudging up slightly
+        applyRate(targetRate * RECOVERY_STEP);
+        smoothPlayingMs = 0;
+      }
+    }, POLL_MS);
+
+    video.addEventListener("waiting", handleWaiting);
+    video.addEventListener("playing", handlePlaying);
+
+    return () => {
+      clearInterval(intervalId);
+      video.removeEventListener("waiting", handleWaiting);
+      video.removeEventListener("playing", handlePlaying);
+      video.playbackRate = 1.0;
+    };
+  }, [remoteStream]);
+
   const triggerPlayPause = useCallback(() => {
     if (onPlayPauseToggle && remoteStream) {
       onPlayPauseToggle();

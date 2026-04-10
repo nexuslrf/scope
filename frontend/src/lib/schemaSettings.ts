@@ -14,6 +14,8 @@ export interface SchemaFieldUI {
   is_load_param?: boolean;
   /** Short label for the UI. When set, used instead of description for the field label. */
   label?: string;
+  /** Discrete step size for slider fields. When set, the slider snaps to multiples of this value. */
+  step?: number;
 }
 
 export interface SchemaProperty {

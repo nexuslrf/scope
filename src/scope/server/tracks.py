@@ -82,12 +82,19 @@ class VideoProcessingTrack(MediaStreamTrack):
             raise MediaStreamError
 
         if hasattr(self, "timestamp"):
-            # Calculate wait time based on current frame rate
             current_time = time.time()
-            time_since_last_frame = current_time - self.last_frame_time
-
-            # Wait for the appropriate interval based on current FPS
             target_interval = self.frame_ptime  # Current frame period
+
+            # Cap how far behind we consider ourselves. If the pipeline stalled
+            # and we've been waiting longer than one frame interval, treat it as
+            # exactly one interval behind — not more. Without this cap, a long
+            # stall followed by a new batch causes all queued frames to be served
+            # immediately (wait_time < 0 for every frame), producing a visible
+            # speedup burst.
+            time_since_last_frame = min(
+                current_time - self.last_frame_time,
+                target_interval,
+            )
             wait_time = target_interval - time_since_last_frame
 
             if wait_time > 0:

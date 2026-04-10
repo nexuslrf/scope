@@ -1178,7 +1178,7 @@ class PipelineManager:
             return pipeline
 
         elif pipeline_id == "helios":
-            from scope.core.pipelines.helios.pipeline import HeliosPipeline
+            from scope_helios_x.pipeline import HeliosPipeline
 
             from .distributed import (
                 CMD_LOAD,
@@ -1247,7 +1247,7 @@ class PipelineManager:
             return pipeline
 
         elif pipeline_id == "helios-vace":
-            from scope.core.pipelines.helios.pipeline_vace import HeliosVACEPipeline
+            from scope_helios_x.pipeline_vace import HeliosVACEPipeline
 
             from .models_config import get_models_dir
 
@@ -1282,7 +1282,7 @@ class PipelineManager:
             return pipeline
 
         elif pipeline_id == "helios-sdedit":
-            from scope.core.pipelines.helios.pipeline_sdedit import HeliosSDEditPipeline
+            from scope_helios_x.pipeline_sdedit import HeliosSDEditPipeline
 
             from .distributed import (
                 CMD_LOAD,
@@ -1310,6 +1310,7 @@ class PipelineManager:
                     "source_guidance_scale": params.get("source_guidance_scale", 1.0),
                     "target_guidance_scale": params.get("target_guidance_scale", 1.0),
                     "zeta_scale": params.get("zeta_scale", 1e-3),
+                    "frame_strategy": params.get("frame_strategy", "sequential"),
                 }
             )
             self._apply_load_params(
@@ -1321,6 +1322,8 @@ class PipelineManager:
             )
 
             enable_cp = is_distributed()
+            enable_compile = params.get("enable_compile", False)
+            text_encoder_quantization = params.get("text_encoder_quantization", None)
 
             if enable_cp and is_main_rank():
                 broadcast_command(
@@ -1333,6 +1336,8 @@ class PipelineManager:
                 device=get_device(),
                 dtype=torch.bfloat16,
                 enable_context_parallel=enable_cp,
+                enable_compile=enable_compile,
+                text_encoder_quantization=text_encoder_quantization,
             )
 
             if enable_cp and is_main_rank():

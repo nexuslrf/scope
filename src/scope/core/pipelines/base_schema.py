@@ -106,6 +106,7 @@ def ui_field_config(
     is_load_param: bool = False,
     label: str | None = None,
     category: Literal["configuration", "input"] | None = None,
+    step: float | None = None,
 ) -> dict[str, Any]:
     """Build json_schema_extra for a field so the frontend renders it in Settings or Input & Controls.
 
@@ -144,6 +145,8 @@ def ui_field_config(
         ui["modes"] = modes
     if label is not None:
         ui["label"] = label
+    if step is not None:
+        ui["step"] = step
     return {"ui": ui}
 
 

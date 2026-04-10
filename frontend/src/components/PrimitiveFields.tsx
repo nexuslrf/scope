@@ -188,9 +188,13 @@ export function SliderField({
   const min = typeof prop.minimum === "number" ? prop.minimum : 0;
   const max = typeof prop.maximum === "number" ? prop.maximum : 100;
   const isFloat = prop.type === "number";
-  const step = isFloat ? 0.01 : 1;
-  const incrementAmount = isFloat ? 0.01 : 1;
+  const uiStep = typeof prop.ui?.step === "number" ? prop.ui.step : undefined;
+  const step = uiStep ?? (isFloat ? 0.01 : 1);
+  const incrementAmount = uiStep ?? (isFloat ? 0.01 : 1);
   const numVal = isFloat ? rawVal : Math.round(rawVal);
+  const snapToStep = uiStep
+    ? (v: number) => Math.round(v / uiStep) * uiStep
+    : null;
   return (
     <SliderWithInput
       label={displayLabel}
@@ -206,7 +210,11 @@ export function SliderField({
       valueFormatter={isFloat ? (v: number) => v : (v: number) => Math.round(v)}
       inputParser={
         isFloat
-          ? (v: string) => parseFloat(v) || numVal
+          ? (v: string) => {
+              const parsed = parseFloat(v);
+              const val = isNaN(parsed) ? numVal : parsed;
+              return snapToStep ? snapToStep(Math.min(max, Math.max(min, val))) : val;
+            }
           : (v: string) => Math.round(parseFloat(v) || numVal)
       }
       disabled={disabled}
