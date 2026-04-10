@@ -158,9 +158,6 @@ def _register_pipelines():
             "RewardForcingPipeline",
         ),
         ("memflow", ".memflow.pipeline", "MemFlowPipeline"),
-        ("helios", ".helios.pipeline", "HeliosPipeline"),
-        ("helios-vace", ".helios.pipeline_vace", "HeliosVACEPipeline"),
-        ("helios-sdedit", ".helios.pipeline_sdedit", "HeliosSDEditPipeline"),
         ("passthrough", ".passthrough.pipeline", "PassthroughPipeline"),
         (
             "video_depth_anything",

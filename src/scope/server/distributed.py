@@ -19,7 +19,7 @@ Architecture:
   receive_command(), which means workers are always ready before inference
   starts.
 
-Currently supported pipelines: helios
+Currently supported pipelines: helios, helios-sdedit
 """
 
 import logging
@@ -42,7 +42,7 @@ CMD_LOAD = 1
 CMD_CALL = 2
 
 # Pipelines that support distributed context-parallel inference.
-DISTRIBUTED_PIPELINE_IDS: frozenset[str] = frozenset({"helios"})
+DISTRIBUTED_PIPELINE_IDS: frozenset[str] = frozenset({"helios", "helios-sdedit"})
 
 
 # ---------------------------------------------------------------------------

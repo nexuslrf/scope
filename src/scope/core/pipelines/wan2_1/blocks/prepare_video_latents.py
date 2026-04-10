@@ -19,6 +19,7 @@ class PrepareVideoLatentsBlock(ModularPipelineBlocks):
     @property
     def expected_components(self) -> list[ComponentSpec]:
         return [
+            ComponentSpec("scheduler", torch.nn.Module),
             ComponentSpec("vae", torch.nn.Module),
         ]
 
@@ -98,12 +99,20 @@ class PrepareVideoLatentsBlock(ModularPipelineBlocks):
             dtype=components.config.dtype,
             generator=rng,
         )
-        # Determine how noisy the latents should be
-        # Higher noise scale -> noiser latents, less of inputs preserved
-        # Lower noise scale -> less noisy latents, more of inputs preserved
-        block_state.latents = noise * block_state.noise_scale + latents * (
-            1 - block_state.noise_scale
+        # Corrupt latents using the scheduler's noise model so injected noise
+        # is aligned with the denoising schedule (SDEdit-style behavior).
+        timestep = int(1000 * block_state.noise_scale) - 100
+        timestep_tensor = torch.full(
+            (latents.shape[0] * latents.shape[1],),
+            timestep,
+            device=components.config.device,
+            dtype=torch.long,
         )
+        block_state.latents = components.scheduler.add_noise(
+            latents.flatten(0, 1),
+            noise.flatten(0, 1),
+            timestep_tensor,
+        ).unflatten(0, latents.shape[:2])
         block_state.generator = rng
 
         self.set_block_state(state, block_state)
